@@ -20,7 +20,7 @@ fn sizeof_varint(v: u32) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Syntax {
     Proto2,
     Proto3,
@@ -32,7 +32,7 @@ impl Default for Syntax {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frequency {
     Optional,
     Repeated,
@@ -273,12 +273,13 @@ impl FieldType {
     fn has_lifetime(
         &self,
         desc: &FileDescriptor,
+        config: &Config,
         packed: bool,
         ignore: &mut Vec<MessageIndex>,
     ) -> bool {
         match *self {
             FieldType::StringCow | FieldType::BytesCow => true, // Cow<[u8]>
-            FieldType::Message(ref m) => m.get_message(desc).has_lifetime(desc, ignore),
+            FieldType::Message(ref m) => m.get_message(desc).has_lifetime(desc, config, ignore),
             FieldType::Fixed64
             | FieldType::Sfixed64
             | FieldType::Double
@@ -288,13 +289,13 @@ impl FieldType {
             | FieldType::Bytes_
             | FieldType::Float => packed, // Cow<[M]>
             FieldType::Map(ref key, ref value) => {
-                key.has_lifetime(desc, false, ignore) || value.has_lifetime(desc, false, ignore)
+                key.has_lifetime(desc, config, false, ignore) || value.has_lifetime(desc, config, false, ignore)
             }
             _ => false,
         }
     }
 
-    fn rust_type(&self, desc: &FileDescriptor) -> Result<String> {
+    fn rust_type(&self, desc: &FileDescriptor, config: &Config) -> Result<String> {
         Ok(match *self {
             FieldType::Int32 | FieldType::Sint32 | FieldType::Sfixed32 => "i32".to_string(),
             FieldType::Int64 | FieldType::Sint64 | FieldType::Sfixed64 => "i64".to_string(),
@@ -313,7 +314,7 @@ impl FieldType {
             }
             FieldType::Message(ref msg) => {
                 let m = msg.get_message(desc);
-                let lifetime = if m.has_lifetime(desc, &mut Vec::new()) {
+                let lifetime = if m.has_lifetime(desc, config, &mut Vec::new()) {
                     "<'a>"
                 } else {
                     ""
@@ -322,8 +323,8 @@ impl FieldType {
             }
             FieldType::Map(ref key, ref value) => format!(
                 "KVMap<{}, {}>",
-                key.rust_type(desc)?,
-                value.rust_type(desc)?
+                key.rust_type(desc, config)?,
+                value.rust_type(desc, config)?
             ),
             FieldType::MessageOrEnum(_) => unreachable!("Message / Enum not resolved"),
         })
@@ -448,9 +449,9 @@ impl Field {
         self.packed.unwrap_or(false)
     }
 
-    fn sanitize_default(&mut self, desc: &FileDescriptor) -> Result<()> {
+    fn sanitize_default(&mut self, desc: &FileDescriptor, config: &Config) -> Result<()> {
         if let Some(ref mut d) = self.default {
-            *d = match &*self.typ.rust_type(desc)? {
+            *d = match &*self.typ.rust_type(desc, config)? {
                 "u32" => format!("{}u32", *d),
                 "u64" => format!("{}u64", *d),
                 "i32" => format!("{}i32", *d),
@@ -502,7 +503,7 @@ impl Field {
             }
         }
         write!(w, "    pub {}: ", self.name)?;
-        let rust_type = self.typ.rust_type(desc)?;
+        let rust_type = self.typ.rust_type(desc, config)?;
         match self.frequency {
             _ if self.boxed => writeln!(w, "Option<Box<{}>>,", rust_type)?,
             Frequency::Optional
@@ -844,14 +845,15 @@ impl Message {
         }
     }
 
-    fn has_lifetime(&self, desc: &FileDescriptor, ignore: &mut Vec<MessageIndex>) -> bool {
+    fn has_lifetime(&self, desc: &FileDescriptor, config: &Config, ignore: &mut Vec<MessageIndex>) -> bool {
         if ignore.contains(&&self.index) {
             return false;
         }
         ignore.push(self.index.clone());
-        let res = self
-            .all_fields()
-            .any(|f| f.typ.has_lifetime(desc, f.packed(), ignore));
+        let res = self.all_fields().any(|f| {
+            f.typ.has_lifetime(desc, config, f.packed(), ignore)
+                && (!f.deprecated || config.add_deprecated_fields)
+        });
         ignore.pop();
         res
     }
@@ -874,7 +876,9 @@ impl Message {
     }
 
     fn is_unit(&self) -> bool {
-        self.fields.is_empty() && self.oneofs.is_empty()
+        self.fields.is_empty()
+            && self.oneofs.is_empty()
+            && self.messages.iter().all(|m| m.is_unit())
     }
 
     fn write_common_uses<W: Write>(
@@ -909,7 +913,7 @@ impl Message {
 
         if config.nostd
             && messages.iter().any(|m| {
-                desc.owned && m.has_lifetime(desc, &mut Vec::new())
+                desc.owned && m.has_lifetime(desc, config, &mut Vec::new())
                     || m.all_fields().any(|f| f.boxed)
             })
         {
@@ -952,7 +956,7 @@ impl Message {
             writeln!(w)?;
         }
 
-        if desc.owned && self.has_lifetime(desc, &mut Vec::new()) {
+        if desc.owned && self.has_lifetime(desc, config, &mut Vec::new()) {
             writeln!(w)?;
             self.write_impl_owned(w, config)?;
         }
@@ -995,6 +999,8 @@ impl Message {
             custom_struct_derive += ", ";
         }
 
+        writeln!(w, "#[allow(clippy::derive_partial_eq_without_eq)]")?;
+
         writeln!(
             w,
             "#[derive({}Debug, Default, PartialEq, Clone)]",
@@ -1014,7 +1020,7 @@ impl Message {
         if config.dont_use_cow {
             ignore.push(self.index.clone());
         }
-        if self.has_lifetime(desc, &mut ignore) {
+        if self.has_lifetime(desc, config, &mut ignore) {
             writeln!(w, "pub struct {}<'a> {{", self.name)?;
         } else {
             writeln!(w, "pub struct {} {{", self.name)?;
@@ -1023,7 +1029,7 @@ impl Message {
             f.write_definition(w, desc, config)?;
         }
         for o in &self.oneofs {
-            o.write_message_definition(w, desc)?;
+            o.write_message_definition(w, desc, config)?;
         }
         writeln!(w, "}}")?;
         Ok(())
@@ -1039,7 +1045,7 @@ impl Message {
         if config.dont_use_cow {
             ignore.push(self.index.clone());
         }
-        if self.has_lifetime(desc, &mut ignore) {
+        if self.has_lifetime(desc, config, &mut ignore) {
             writeln!(w, "impl<'a> MessageInfo for {}<'a> {{", self.name)?;
         } else {
             writeln!(w, "impl MessageInfo for {} {{", self.name)?;
@@ -1076,7 +1082,7 @@ impl Message {
         if config.dont_use_cow {
             ignore.push(self.index.clone());
         }
-        if self.has_lifetime(desc, &mut ignore) {
+        if self.has_lifetime(desc, config, &mut ignore) {
             writeln!(w, "impl<'a> MessageRead<'a> for {}<'a> {{", self.name)?;
             writeln!(
                 w,
@@ -1150,7 +1156,7 @@ impl Message {
         if config.dont_use_cow {
             ignore.push(self.index.clone());
         }
-        if self.has_lifetime(desc, &mut ignore) {
+        if self.has_lifetime(desc, config, &mut ignore) {
             writeln!(w, "impl<'a> MessageWrite for {}<'a> {{", self.name)?;
         } else {
             writeln!(w, "impl MessageWrite for {} {{", self.name)?;
@@ -1166,10 +1172,22 @@ impl Message {
         write!(
             w,
             r#"
+            // IMPORTANT: For any future changes, note that the lifetime parameter
+            // of the `proto` field is set to 'static!!!
+            //
+            // This means that the internals of `proto` should at no point create a
+            // mutable reference to something using that lifetime parameter, on pain
+            // of UB. This applies even though it may be transmuted to a smaller
+            // lifetime later (through `proto()` or `proto_mut()`).
+            //
+            // At the time of writing, the only possible thing that uses the
+            // lifetime parameter is `Cow<'a, T>`, which never does this, so it's
+            // not UB.
+            //
             #[derive(Debug)]
             struct {name}OwnedInner {{
                 buf: Vec<u8>,
-                proto: {name}<'static>,
+                proto: Option<{name}<'static>>,
                 _pin: core::marker::PhantomPinned,
             }}
 
@@ -1177,7 +1195,7 @@ impl Message {
                 fn new(buf: Vec<u8>) -> Result<core::pin::Pin<Box<Self>>> {{
                     let inner = Self {{
                         buf,
-                        proto: unsafe {{ core::mem::MaybeUninit::zeroed().assume_init() }},
+                        proto: None,
                         _pin: core::marker::PhantomPinned,
                     }};
                     let mut pinned = Box::pin(inner);
@@ -1186,8 +1204,8 @@ impl Message {
                     let proto = {name}::from_reader(&mut reader, &pinned.buf)?;
 
                     unsafe {{
-                        let proto = core::mem::transmute::<_, {name}<'static>>(proto);
-                        pinned.as_mut().get_unchecked_mut().proto = proto;
+                        let proto = core::mem::transmute::<_, {name}<'_>>(proto);
+                        pinned.as_mut().get_unchecked_mut().proto = Some(proto);
                     }}
                     Ok(pinned)
                 }}
@@ -1203,28 +1221,21 @@ impl Message {
                     &self.inner.buf
                 }}
 
-                pub fn proto(&self) -> &{name} {{
-                    &self.inner.proto
+                pub fn proto<'a>(&'a self) -> &'a {name}<'a> {{
+                    unsafe {{ core::mem::transmute::<&{name}<'static>, &{name}<'a>>(self.inner.proto.as_ref().unwrap()) }}
+                }}
+
+                pub fn proto_mut<'a>(&'a mut self) -> &'a mut {name}<'a> {{
+                    unsafe {{
+                        let proto = self.inner.as_mut().get_unchecked_mut().proto.as_mut().unwrap();
+                        core::mem::transmute::<_, &mut {name}<'a>>(proto)
+                    }}
                 }}
             }}
 
             impl core::fmt::Debug for {name}Owned {{
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{
-                    self.inner.proto.fmt(f)
-                }}
-            }}
-
-            impl Deref for {name}Owned {{
-                type Target = {name}<'static>;
-
-                fn deref(&self) -> &Self::Target {{
-                    &self.inner.proto
-                }}
-            }}
-
-            impl DerefMut for {name}Owned {{
-                fn deref_mut(&mut self) -> &mut Self::Target {{
-                    unsafe {{ &mut self.inner.as_mut().get_unchecked_mut().proto }}
+                    self.inner.proto.as_ref().unwrap().fmt(f)
                 }}
             }}
 
@@ -1242,20 +1253,20 @@ impl Message {
                 fn try_into(self) -> Result<Vec<u8>> {{
                     let mut buf = Vec::new();
                     let mut writer = Writer::new(&mut buf);
-                    self.deref().write_message(&mut writer)?;
+                    self.proto().write_message(&mut writer)?;
                     Ok(buf)
                 }}
             }}
 
-            #[cfg(feature = "test_helpers")]
-            impl<'a> From<{name}<'a>> for {name}Owned {{
-                fn from(proto: {name}) -> Self {{
-                    use quick_protobuf::{{MessageWrite, Writer}};
-
-                    let mut buf = Vec::new();
-                    let mut writer = Writer::new(&mut buf);
-                    proto.write_message(&mut writer).expect("bad proto serialization");
-                    Self {{ inner: {name}OwnedInner::new(buf).unwrap() }}
+            impl From<{name}<'static>> for {name}Owned {{
+                fn from(proto: {name}<'static>) -> Self {{
+                    Self {{
+                        inner: Box::pin({name}OwnedInner {{
+                            buf: Vec::new(),
+                            proto: Some(proto),
+                            _pin: core::marker::PhantomPinned,
+                        }})
+                    }}
                 }}
             }}
             "#,
@@ -1341,9 +1352,7 @@ impl Message {
         // message will be the module 'a.mod_A', since we can't reuse the message name A as
         // the submodule containing nested items. Also, protos with empty packages always
         // have a module corresponding to the file name.
-        let (child_package, child_module) = if package.is_empty() && module.is_empty() {
-            (self.name.clone(), format!("mod_{}", self.name))
-        } else if package.is_empty() {
+        let (child_package, child_module) = if package.is_empty() {
             self.module = module.to_string();
             (self.name.clone(), format!("{}.mod_{}", module, self.name))
         } else {
@@ -1395,12 +1404,12 @@ impl Message {
         }
     }
 
-    fn sanitize_defaults(&mut self, desc: &FileDescriptor) -> Result<()> {
+    fn sanitize_defaults(&mut self, desc: &FileDescriptor, config: &Config) -> Result<()> {
         for f in self.all_fields_mut() {
-            f.sanitize_default(desc)?;
+            f.sanitize_default(desc, config)?;
         }
         for m in &mut self.messages {
-            m.sanitize_defaults(desc)?;
+            m.sanitize_defaults(desc, config)?;
         }
         Ok(())
     }
@@ -1584,10 +1593,12 @@ pub struct OneOf {
 }
 
 impl OneOf {
-    fn has_lifetime(&self, desc: &FileDescriptor) -> bool {
-        self.fields
-            .iter()
-            .any(|f| !f.deprecated && f.typ.has_lifetime(desc, f.packed(), &mut Vec::new()))
+    fn has_lifetime(&self, desc: &FileDescriptor, config: &Config) -> bool {
+        self.fields.iter().any(|f| {
+            f.typ
+                .has_lifetime(desc, config, f.packed(), &mut Vec::new())
+                && (!f.deprecated || config.add_deprecated_fields)
+        })
     }
 
     fn set_package(&mut self, package: &str, module: &str) {
@@ -1611,13 +1622,13 @@ impl OneOf {
         writeln!(w)?;
         self.write_definition(w, desc, config)?;
         writeln!(w)?;
-        self.write_impl_default(w, desc)?;
+        self.write_impl_default(w, desc, config)?;
         Ok(())
     }
 
     fn write_definition<W: Write>(&self, w: &mut W, desc: &FileDescriptor, config: &Config) -> Result<()> {
         writeln!(w, "#[derive(Debug, PartialEq, Clone)]")?;
-        if self.has_lifetime(desc) {
+        if self.has_lifetime(desc, config) {
             writeln!(w, "pub enum OneOf{}<'a> {{", self.name)?;
         } else {
             writeln!(w, "pub enum OneOf{} {{", self.name)?;
@@ -1631,7 +1642,7 @@ impl OneOf {
                 }
             }
 
-            let rust_type = f.typ.rust_type(desc)?;
+            let rust_type = f.typ.rust_type(desc, config)?;
             if f.boxed {
                 writeln!(w, "    {}(Box<{}>),", f.name, rust_type)?;
             } else {
@@ -1657,7 +1668,7 @@ impl OneOf {
         // For the first of each enumeration type, generate an impl From<> for it.
         let mut handled_fields = Vec::new();
         for f in self.fields.iter().filter(|f| !f.deprecated || config.add_deprecated_fields) {
-            let rust_type = f.typ.rust_type(desc)?;
+            let rust_type = f.typ.rust_type(desc, config)?;
             if handled_fields.contains(&rust_type) {
                 continue;
             }
@@ -1673,8 +1684,8 @@ impl OneOf {
         Ok(())
     }
 
-    fn write_impl_default<W: Write>(&self, w: &mut W, desc: &FileDescriptor) -> Result<()> {
-        if self.has_lifetime(desc) {
+    fn write_impl_default<W: Write>(&self, w: &mut W, desc: &FileDescriptor, config: &Config) -> Result<()> {
+        if self.has_lifetime(desc, config) {
             writeln!(w, "impl<'a> Default for OneOf{}<'a> {{", self.name)?;
         } else {
             writeln!(w, "impl Default for OneOf{} {{", self.name)?;
@@ -1686,8 +1697,8 @@ impl OneOf {
         Ok(())
     }
 
-    fn write_message_definition<W: Write>(&self, w: &mut W, desc: &FileDescriptor) -> Result<()> {
-        if self.has_lifetime(desc) {
+    fn write_message_definition<W: Write>(&self, w: &mut W, desc: &FileDescriptor, config: &Config) -> Result<()> {
+        if self.has_lifetime(desc, config) {
             writeln!(
                 w,
                 "    pub {}: {}OneOf{}<'a>,",
@@ -1853,7 +1864,7 @@ impl FileDescriptor {
             desc.convert_field_types(&FieldType::StringCow, &FieldType::String_);
             desc.convert_field_types(&FieldType::BytesCow, &FieldType::Bytes_);
         }
-        desc.set_defaults()?;
+        desc.set_defaults(config)?;
         desc.sanitize_names();
 
         if config.single_module {
@@ -1926,7 +1937,11 @@ impl FileDescriptor {
     /// Opens a proto file, reads it and returns raw parsed data
     pub fn read_proto(in_file: &Path, import_search_path: &[PathBuf]) -> Result<FileDescriptor> {
         let file = std::fs::read_to_string(in_file)?;
-        let (_, mut desc) = file_descriptor(&file).map_err(|e| Error::Nom(e))?;
+        let (rem, mut desc) = file_descriptor(&file).map_err(Error::Nom)?;
+        let rem = rem.trim();
+        if !rem.is_empty() {
+            return Err(Error::TrailingGarbage(rem.chars().take(50).collect()));
+        }
         for mut m in &mut desc.messages {
             if m.path.as_os_str().is_empty() {
                 m.path = in_file.to_path_buf();
@@ -1959,10 +1974,10 @@ impl FileDescriptor {
     /// Get messages and enums from imports
     fn fetch_imports(&mut self, in_file: &Path, import_search_path: &[PathBuf]) -> Result<()> {
         for m in &mut self.messages {
-            m.set_package("", &self.module);
+            m.set_package(&self.package, &self.module);
         }
         for m in &mut self.enums {
-            m.set_package("", &self.module);
+            m.set_package(&self.package, &self.module);
         }
 
         for import in &self.import_paths {
@@ -2025,7 +2040,7 @@ impl FileDescriptor {
         Ok(())
     }
 
-    fn set_defaults(&mut self) -> Result<()> {
+    fn set_defaults(&mut self, config: &Config) -> Result<()> {
         // set map fields as required (they are equivalent to repeated message)
         for m in &mut self.messages {
             m.set_map_required();
@@ -2040,7 +2055,7 @@ impl FileDescriptor {
         //let msgs = self.messages.clone();
         let copy = self.clone();
         for m in &mut self.messages {
-            m.sanitize_defaults(&copy)?; //&msgs, &self.enums)?; ???
+            m.sanitize_defaults(&copy, config)?; //&msgs, &self.enums)?; ???
         }
         // force packed only on primitives
         for m in &mut self.messages {
@@ -2153,9 +2168,9 @@ impl FileDescriptor {
         ) {
             m.index = index.clone();
             if m.package.is_empty() {
-                full_msgs.insert(m.name.clone(), index.clone());
+                full_msgs.entry(m.name.clone()).or_insert_with(|| index.clone());
             } else {
-                full_msgs.insert(format!("{}.{}", m.package, m.name), index.clone());
+                full_msgs.entry(format!("{}.{}", m.package, m.name)).or_insert_with(|| index.clone());
             }
             for (i, e) in m.enums.iter_mut().enumerate() {
                 let index = EnumIndex {
@@ -2163,7 +2178,7 @@ impl FileDescriptor {
                     index: i,
                 };
                 e.index = index.clone();
-                full_enums.insert(format!("{}.{}", e.package, e.name), index);
+                full_enums.entry(format!("{}.{}", e.package, e.name)).or_insert(index);
             }
             for (i, m) in m.messages.iter_mut().enumerate() {
                 index.push(i);
@@ -2187,9 +2202,9 @@ impl FileDescriptor {
             };
             e.index = index.clone();
             if e.package.is_empty() {
-                full_enums.insert(e.name.clone(), index.clone());
+                full_enums.entry(e.name.clone()).or_insert_with(|| index.clone());
             } else {
-                full_enums.insert(format!("{}.{}", e.package, e.name), index.clone());
+                full_enums.entry(format!("{}.{}", e.package, e.name)).or_insert_with(|| index.clone());
             }
         }
         (full_msgs, full_enums)
@@ -2223,19 +2238,23 @@ impl FileDescriptor {
                     let test_names: Vec<String> = if name.starts_with('.') {
                         vec![name.clone().split_off(1)]
                     } else if m.package.is_empty() {
-                        vec![name.clone(), format!("{}.{}", m.name, name)]
+                        vec![format!("{}.{}", m.name, name), name.clone()]
                     } else {
-                        vec![
-                            name.clone(),
-                            format!("{}.{}", m.package, name),
+                        let mut v = vec![
                             format!("{}.{}.{}", m.package, m.name, name),
-                        ]
+                            format!("{}.{}", m.package, name),
+                        ];
+                        for (index, _) in m.package.match_indices('.').rev() {
+                            v.push(format!("{}.{}", &m.package[..index], name));
+                        }
+                        v.push(name.clone());
+                        v
                     };
                     for name in &test_names {
-                        if let Some(msg) = full_msgs.get(&*name) {
+                        if let Some(msg) = full_msgs.get(name) {
                             *typ = FieldType::Message(msg.clone());
                             continue 'types;
-                        } else if let Some(e) = full_enums.get(&*name) {
+                        } else if let Some(e) = full_enums.get(name) {
                             *typ = FieldType::Enum(e.clone());
                             continue 'types;
                         }
@@ -2319,9 +2338,9 @@ impl FileDescriptor {
         )?;
 
         if self.owned {
-            write!(
+            writeln!(
                 w,
-                "use core::{{convert::{{TryFrom, TryInto}}, ops::{{Deref, DerefMut}}}};"
+                "use core::convert::{{TryFrom, TryInto}};"
             )?;
         }
 
