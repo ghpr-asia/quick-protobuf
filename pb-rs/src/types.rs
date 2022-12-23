@@ -242,7 +242,7 @@ impl FieldType {
             FieldType::Bytes_ => Some("vec![]"),
             FieldType::Enum(ref e) => {
                 let e = e.get_enum(desc);
-                Some(&*e.fully_qualified_fields[0].0)
+                Some(&*e.fields[0].fully_qualified_name)
             }
             FieldType::Message(_) => None,
             FieldType::Map(_, _) => None,
@@ -482,12 +482,10 @@ impl Field {
         desc: &FileDescriptor,
         config: &Config,
     ) -> Result<()> {
-        if self.deprecated {
-            if config.add_deprecated_fields {
-                writeln!(w, "    #[deprecated]")?;
-            } else {
-                return Ok(());
-            }
+        match (self.deprecated, config.add_deprecated_fields) {
+            (true, true) => writeln!(w, "    #[deprecated]")?,
+            (true, false) => return Ok(()),
+            _ => {}
         }
         write!(w, "    pub {}: ", self.name)?;
         let rust_type = self.typ.rust_type(desc, config)?;
@@ -963,7 +961,7 @@ impl Message {
                 m.write(w, desc, config)?;
             }
             for e in &self.enums {
-                e.write(w)?;
+                e.write(w, config)?;
             }
             for o in &self.oneofs {
                 o.write(w, desc, config)?;
@@ -1342,7 +1340,7 @@ impl Message {
             if let Some(var) = f.default.as_ref() {
                 if let FieldType::Enum(ref e) = f.typ {
                     let e = e.get_enum(desc);
-                    e.fields.iter().find(|&(ref name, _)| name == var)
+                    e.fields.iter().find(|&f| f.name == *var)
                     .ok_or_else(|| Error::InvalidDefaultEnum(format!(
                                 "Error in message {}\n\
                                 Enum field {:?} has a default value '{}' which is not valid for enum index {:?}",
@@ -1477,11 +1475,61 @@ impl RpcService {
 pub type RpcGeneratorFunction = Box<dyn Fn(&RpcService, &mut dyn Write) -> Result<()>>;
 
 #[derive(Debug, Clone, Default)]
+pub struct EnumField {
+    pub name: String,
+    pub partially_qualified_name: String,
+    pub fully_qualified_name: String,
+    pub tag: i32,
+    pub deprecated: bool,
+}
+
+impl EnumField {
+    fn set_qualified_names(&mut self, enum_name: &str, module: &str) {
+        self.partially_qualified_name = format!("{}::{}", enum_name, self.name);
+        self.fully_qualified_name = if module.is_empty() {
+            self.partially_qualified_name.clone()
+        } else {
+            format!("{}::{}", module.replace('.', "::"), self.partially_qualified_name)
+        };
+    }
+
+    fn write_definition<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
+        match (self.deprecated, config.add_deprecated_fields) {
+            (true, true) => writeln!(w, "    #[deprecated]")?,
+            (true, false) => return Ok(()),
+            _ => {}
+        }
+        writeln!(w, "    {} = {},", self.name, self.tag)?;
+        Ok(())
+    }
+
+    fn write_from_i32<W: Write>(&self, w: &mut W, enum_name: &str, config: &Config) -> Result<()> {
+        if self.deprecated && !config.add_deprecated_fields {
+            return Ok(());
+        }
+        writeln!(w, "            {} => {}::{},", self.tag, enum_name, self.name)?;
+        Ok(())
+    }
+
+    fn write_from_str<W: Write>(&self, w: &mut W, enum_name: &str, config: &Config) -> Result<()> {
+        if self.deprecated && !config.add_deprecated_fields {
+            return Ok(());
+        }
+        writeln!(w, "            {:?} => {}::{},", self.name, enum_name, self.name)?;
+        Ok(())
+    }
+
+    fn write_impl_default<W: Write>(&self, w: &mut W) -> Result<()> {
+        // deprecation check in caller for code readability reasons
+        writeln!(w, "        {}", self.partially_qualified_name)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Enumerator {
     pub name: String,
-    pub fields: Vec<(String, i32)>,
-    pub fully_qualified_fields: Vec<(String, i32)>,
-    pub partially_qualified_fields: Vec<(String, i32)>,
+    pub fields: Vec<EnumField>,
     pub imported: bool,
     pub package: String,
     pub module: String,
@@ -1494,30 +1542,16 @@ impl Enumerator {
     fn set_package(&mut self, package: &str, module: &str) {
         self.package = package.to_string();
         self.module = module.to_string();
-        self.partially_qualified_fields = self
-            .fields
-            .iter()
-            .map(|f| (format!("{}::{}", &self.name, f.0), f.1))
-            .collect();
-        self.fully_qualified_fields = self
-            .partially_qualified_fields
-            .iter()
-            .map(|pqf| {
-                let fqf = if self.module.is_empty() {
-                    pqf.0.clone()
-                } else {
-                    format!("{}::{}", self.module.replace('.', "::"), pqf.0)
-                };
-                (fqf, pqf.1)
-            })
-            .collect();
+        for f in &mut self.fields {
+            f.set_qualified_names(&self.name, module)
+        }
     }
 
     fn sanitize_names(&mut self) {
         sanitize_keyword(&mut self.name);
         sanitize_keyword(&mut self.package);
         for f in self.fields.iter_mut() {
-            sanitize_keyword(&mut f.0);
+            sanitize_keyword(&mut f.name);
         }
     }
 
@@ -1525,48 +1559,52 @@ impl Enumerator {
         get_modules(&self.module, self.imported, desc)
     }
 
-    fn write<W: Write>(&self, w: &mut W) -> Result<()> {
+    fn write<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
         println!("Writing enum {}", self.name);
         writeln!(w)?;
-        self.write_definition(w)?;
+        self.write_definition(w, config)?;
         writeln!(w)?;
         if self.fields.is_empty() {
             Ok(())
         } else {
-            self.write_impl_default(w)?;
+            self.write_impl_default(w, config)?;
             writeln!(w)?;
-            self.write_from_i32(w)?;
+            self.write_from_i32(w, config)?;
             writeln!(w)?;
-            self.write_from_str(w)
+            self.write_from_str(w, config)
         }
     }
 
-    fn write_definition<W: Write>(&self, w: &mut W) -> Result<()> {
+    fn write_definition<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
         writeln!(w, "#[derive(Debug, PartialEq, Eq, Clone, Copy)]")?;
         writeln!(w, "pub enum {} {{", self.name)?;
-        for &(ref f, ref number) in &self.fields {
-            writeln!(w, "    {} = {},", f, number)?;
+        for f in &self.fields {
+            f.write_definition(w, config)?;
         }
         writeln!(w, "}}")?;
         Ok(())
     }
 
-    fn write_impl_default<W: Write>(&self, w: &mut W) -> Result<()> {
+    fn write_impl_default<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
         writeln!(w, "impl Default for {} {{", self.name)?;
         writeln!(w, "    fn default() -> Self {{")?;
-        // TODO: check with default field and return error if there is no field
-        writeln!(w, "        {}", self.partially_qualified_fields[0].0)?;
+        for f in &self.fields {
+            if !f.deprecated || config.add_deprecated_fields {
+                f.write_impl_default(w)?;
+                break;
+            }
+        }
         writeln!(w, "    }}")?;
         writeln!(w, "}}")?;
         Ok(())
     }
 
-    fn write_from_i32<W: Write>(&self, w: &mut W) -> Result<()> {
+    fn write_from_i32<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
         writeln!(w, "impl From<i32> for {} {{", self.name)?;
         writeln!(w, "    fn from(i: i32) -> Self {{")?;
         writeln!(w, "        match i {{")?;
-        for &(ref f, ref number) in &self.fields {
-            writeln!(w, "            {} => {}::{},", number, self.name, f)?;
+        for f in &self.fields {
+            f.write_from_i32(w, &self.name, config)?;
         }
         writeln!(w, "            _ => Self::default(),")?;
         writeln!(w, "        }}")?;
@@ -1575,12 +1613,12 @@ impl Enumerator {
         Ok(())
     }
 
-    fn write_from_str<W: Write>(&self, w: &mut W) -> Result<()> {
+    fn write_from_str<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
         writeln!(w, "impl<'a> From<&'a str> for {} {{", self.name)?;
         writeln!(w, "    fn from(s: &'a str) -> Self {{")?;
         writeln!(w, "        match s {{")?;
-        for &(ref f, _) in &self.fields {
-            writeln!(w, "            {:?} => {}::{},", f, self.name, f)?;
+        for f in &self.fields {
+            f.write_from_str(w, &self.name, config)?;
         }
         writeln!(w, "            _ => Self::default(),")?;
         writeln!(w, "        }}")?;
@@ -2293,7 +2331,7 @@ impl FileDescriptor {
         self.write_package_start(w)?;
         self.write_uses(w, config)?;
         self.write_imports(w)?;
-        self.write_enums(w)?;
+        self.write_enums(w, config)?;
         self.write_messages(w, config)?;
         self.write_rpc_services(w, config)?;
         self.write_package_end(w)?;
@@ -2382,17 +2420,17 @@ impl FileDescriptor {
         Ok(())
     }
 
-    fn write_enums<W: Write>(&self, w: &mut W) -> Result<()> {
+    fn write_enums<W: Write>(&self, w: &mut W, config: &Config) -> Result<()> {
         for m in self.enums.iter().filter(|e| !e.imported) {
             println!("Writing enum {}", m.name);
             writeln!(w)?;
-            m.write_definition(w)?;
+            m.write_definition(w, config)?;
             writeln!(w)?;
-            m.write_impl_default(w)?;
+            m.write_impl_default(w, config)?;
             writeln!(w)?;
-            m.write_from_i32(w)?;
+            m.write_from_i32(w, config)?;
             writeln!(w)?;
-            m.write_from_str(w)?;
+            m.write_from_str(w, config)?;
         }
         Ok(())
     }

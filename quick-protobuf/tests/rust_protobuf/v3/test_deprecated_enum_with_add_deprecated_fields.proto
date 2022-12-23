@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+enum Thing {
+    A = 0;
+    B = 1;
+    C = 2 [deprecated = true];
+    D = 3;
+    E = 4;
+}

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str;
 
 use crate::types::{
-    Enumerator, Field, FieldType, FileDescriptor, Frequency, Message, OneOf,
+    Enumerator, EnumField, Field, FieldType, FileDescriptor, Frequency, Message, OneOf,
     RpcFunctionDeclaration, RpcService, Syntax,
 };
 
@@ -368,35 +368,33 @@ fn message(input: &str) -> IResult<&str, Message> {
     )(input)
 }
 
-fn enum_field(input: &str) -> IResult<&str, (String, i32)> {
-    terminated(
-        separated_pair(
-            word,
-            tuple((many0(br), tag("="), many0(br))),
-            alt((hex_integer, integer)),
-        ),
+fn enum_field(input: &str) -> IResult<&str, EnumField> {
+    map(
         pair(
-            many0(alt((
-                br,
-                // TODO: add proper deprecation later. We ignore deprecated enum
-                // fields for now
-                value(
-                    (),
-                    tuple((
-                        tag("["),
-                        many0(multispace1),
-                        tag("deprecated"),
-                        many0(multispace1),
-                        tag("="),
-                        many0(multispace1),
-                        word,
-                        many0(multispace1),
-                        tag("]"),
-                    )),
-                ),
-            ))),
-            tag(";"),
-        ),
+            separated_pair(
+                word,
+                tuple((many0(br), tag("="), many0(br))),
+                alt((hex_integer, integer)),
+            ),
+            delimited(many0(br), many0(key_val), pair(many0(br), tag(";"))),
+        ), |((name, tag), key_vals)| {
+            EnumField {
+                name,
+                partially_qualified_name: "UNINIT".to_owned(),
+                fully_qualified_name: "UNINIT".to_owned(),
+                tag,
+                deprecated: key_vals
+                    .iter()
+                    .find_map(|&(k, v)| {
+                        if k == "deprecated" {
+                            Some(v.parse().expect("Cannot parse Deprecated value"))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false),
+            }
+        }
     )(input)
 }
 

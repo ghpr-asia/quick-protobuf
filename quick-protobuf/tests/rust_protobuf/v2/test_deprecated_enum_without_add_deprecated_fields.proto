@@ -1,0 +1,9 @@
+syntax = "proto2";
+
+enum Thing {
+    A = 5; // in case anyone copies this over to Proto3, this should fail to compile
+    B = 1;
+    C = 2 [deprecated = true];
+    D = 3;
+    E = 4;
+}

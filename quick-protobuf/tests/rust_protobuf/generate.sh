@@ -26,6 +26,8 @@ custom_pbrs_args["v2/test_owned_pb.proto"]="--owned"
 custom_pbrs_args["v3/test_owned_pb.proto"]="--owned"
 custom_pbrs_args["v2/test_deprecated_lifetime_can_compile.proto"]="--add-deprecated-fields"
 custom_pbrs_args["v3/test_deprecated_lifetime_can_compile.proto"]="--add-deprecated-fields"
+custom_pbrs_args["v2/test_deprecated_enum_with_add_deprecated_fields.proto"]="--add-deprecated-fields"
+custom_pbrs_args["v3/test_deprecated_enum_with_add_deprecated_fields.proto"]="--add-deprecated-fields"
 
 # Combined stdout and stderr for codegen of unexpectedly failed file.
 declare -A outs
