@@ -8,6 +8,16 @@
   - test: Adding missing tests
   - chore: Changes to the build process or auxiliary tools/libraries/documentation
 
+## quick-protobuf 0.9.0
+- feat: add PackedFixed
+- fix: fix comment and whitespace parsing
+- fix: fix default derive
+- fix: custom default not showing up in get_size() and write_message()
+- style: update codebase formatting
+- test: add test for get_size()
+- test: update test output error messages
+- chore: add msrv for crate packages
+
 ## pb-rs 0.10.0
 - fix: fix nested items and package name resolution
 - fix: parser now parses comments successfully
