@@ -8,6 +8,11 @@
   - test: Adding missing tests
   - chore: Changes to the build process or auxiliary tools/libraries/documentation
 
+## quick-protobuf 0.9.0
+- style: update codebase formatting
+- test: update test output error messages
+- chore: add msrv for crate packages
+
 ## pb-rs 0.10.0
 - fix: fix nested items and package name resolution
 - fix: parser now parses comments successfully
