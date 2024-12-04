@@ -1,4 +1,4 @@
-[project]
+[package]
 name = "perftest"
 version = "0.0.0"
 authors = ["Stepan Koltsov <stepan.koltsov@gmail.com>",

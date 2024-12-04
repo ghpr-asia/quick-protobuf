@@ -514,6 +514,11 @@ impl FieldType {
     }
 }
 
+enum FieldWriteStatus {
+    Written,
+    Skipped,
+}
+
 #[derive(Debug, Clone)]
 pub struct Field {
     pub name: String,
@@ -859,9 +864,9 @@ impl Field {
         w: &mut W,
         desc: &FileDescriptor,
         config: &Config,
-    ) -> Result<()> {
+    ) -> Result<FieldWriteStatus> {
         if self.deprecated && !config.add_deprecated_fields {
-            return Ok(());
+            return Ok(FieldWriteStatus::Skipped);
         }
 
         let (val, val_cow) = if self.frequency.is_map() {
@@ -875,7 +880,7 @@ impl Field {
 
         if self.boxed {
             writeln!(w, "msg.{} = Some(Box::new({})),", name, val)?;
-            return Ok(());
+            return Ok(FieldWriteStatus::Written);
         }
 
         match self.frequency.into() {
@@ -924,14 +929,13 @@ impl Field {
                         self.name
                     )?;
                     writeln!(w, "                }}")?;
-                    return Ok(());
                 } else {
                     unreachable!();
                 }
             }
-        }
+        };
 
-        Ok(())
+        Ok(FieldWriteStatus::Written)
     }
 
     fn write_get_size<W: Write>(
@@ -1082,9 +1086,9 @@ impl Field {
         w: &mut W,
         desc: &FileDescriptor,
         config: &Config,
-    ) -> Result<()> {
+    ) -> Result<FieldWriteStatus> {
         if self.deprecated && !config.add_deprecated_fields {
-            return Ok(());
+            return Ok(FieldWriteStatus::Skipped);
         }
 
         write!(w, "        ")?;
@@ -1237,7 +1241,7 @@ impl Field {
                 }
             }
         }
-        Ok(())
+        Ok(FieldWriteStatus::Written)
     }
 }
 
@@ -1689,7 +1693,6 @@ impl Message {
         writeln!(w, "}}")?;
         Ok(())
     }
-
     fn write_impl_message_read<W: Write>(
         &self,
         w: &mut W,
@@ -1727,15 +1730,29 @@ impl Message {
             )?;
         }
 
-        writeln!(w, "        let mut msg = Self::default();")?;
+        let mut buffer = Vec::new();
+
+        let fields_mutate = self.fields.iter().try_fold(false, |acc, f| {
+            f.write_match_tag(&mut buffer, desc, config)
+                .map(|status| acc || matches!(status, FieldWriteStatus::Written))
+        })?;
+
+        let oneofs_mutate = self.oneofs.iter().try_fold(false, |acc, o| {
+            o.write_match_tag(&mut buffer, desc, config)
+                .map(|status| acc || matches!(status, FieldWriteStatus::Written))
+        })?;
+
+        if fields_mutate || oneofs_mutate {
+            writeln!(w, "        let mut msg = Self::default();")?;
+        } else {
+            writeln!(w, "        let msg = Self::default();")?;
+        }
+
         writeln!(w, "        while !r.is_eof() {{")?;
         writeln!(w, "            match r.next_tag(bytes) {{")?;
-        for f in &self.fields {
-            f.write_match_tag(w, desc, config)?;
-        }
-        for o in &self.oneofs {
-            o.write_match_tag(w, desc, config)?;
-        }
+
+        w.write_all(&buffer)?;
+
         writeln!(
             w,
             "                Ok(t) => {{ r.read_unknown(bytes, t)?; }}"
@@ -1940,16 +1957,31 @@ impl Message {
         desc: &FileDescriptor,
         config: &Config,
     ) -> Result<()> {
+        let mut buffer = Vec::new();
+
+        let fields_used = self.fields.iter().try_fold(false, |acc, f| {
+            f.write_write(&mut buffer, desc, config)
+                .map(|status| acc || matches!(status, FieldWriteStatus::Written))
+        })?;
+
+        let oneofs_used = self.oneofs.iter().try_fold(false, |acc, o| {
+            o.write_write(&mut buffer, desc, config)
+                .map(|status| acc || matches!(status, FieldWriteStatus::Written))
+        })?;
+
+        let writer_param = if fields_used || oneofs_used {
+            "w"
+        } else {
+            "_w"
+        };
         writeln!(
             w,
-            "    fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {{"
+            "    fn write_message<W: WriterBackend>(&self, {}: &mut Writer<W>) -> Result<()> {{",
+            writer_param
         )?;
-        for f in &self.fields {
-            f.write_write(w, desc, config)?;
-        }
-        for o in &self.oneofs {
-            o.write_write(w, desc, config)?;
-        }
+
+        w.write_all(&buffer)?;
+
         writeln!(w, "        Ok(())")?;
         writeln!(w, "    }}")?;
         Ok(())
@@ -2401,38 +2433,49 @@ impl OneOf {
         w: &mut W,
         desc: &FileDescriptor,
         config: &Config,
-    ) -> Result<()> {
-        for f in self
+    ) -> Result<FieldWriteStatus> {
+        let field_statuses = self
             .fields
             .iter()
             .filter(|f| !f.deprecated || config.add_deprecated_fields)
-        {
-            let (val, val_cow) = f.typ.read_fn(desc)?;
-            if f.boxed {
-                writeln!(
-                    w,
-                    "                Ok({}) => msg.{} = {}OneOf{}::{}(Box::new({})),",
-                    f.tag(),
-                    self.name,
-                    self.get_modules(desc),
-                    self.name,
-                    f.name,
-                    val
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "                Ok({}) => msg.{} = {}OneOf{}::{}({}),",
-                    f.tag(),
-                    self.name,
-                    self.get_modules(desc),
-                    self.name,
-                    f.name,
-                    val_cow
-                )?;
-            }
-        }
-        Ok(())
+            .map(|f| -> Result<FieldWriteStatus> {
+                let (val, val_cow) = f.typ.read_fn(desc)?;
+                if f.boxed {
+                    writeln!(
+                        w,
+                        "                Ok({}) => msg.{} = {}OneOf{}::{}(Box::new({})),",
+                        f.tag(),
+                        self.name,
+                        self.get_modules(desc),
+                        self.name,
+                        f.name,
+                        val
+                    )?;
+                } else {
+                    writeln!(
+                        w,
+                        "                Ok({}) => msg.{} = {}OneOf{}::{}({}),",
+                        f.tag(),
+                        self.name,
+                        self.get_modules(desc),
+                        self.name,
+                        f.name,
+                        val_cow
+                    )?;
+                }
+                Ok(FieldWriteStatus::Written)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let any_field_mutates = field_statuses
+            .into_iter()
+            .any(|status| matches!(status, FieldWriteStatus::Written));
+
+        Ok(if any_field_mutates {
+            FieldWriteStatus::Written
+        } else {
+            FieldWriteStatus::Skipped
+        })
     }
 
     fn write_get_size<W: Write>(
@@ -2495,14 +2538,19 @@ impl OneOf {
         w: &mut W,
         desc: &FileDescriptor,
         config: &Config,
-    ) -> Result<()> {
+    ) -> Result<FieldWriteStatus> {
         writeln!(w, "        match &self.{} {{", self.name)?;
-        for f in self
+
+        let field_statuses = self
             .fields
             .iter()
             .filter(|f| !f.deprecated || config.add_deprecated_fields)
-        {
-            if f.typ.need_to_dereference() || f.boxed {
+            .map(|f| {
+                let operator = if f.typ.need_to_dereference() || f.boxed {
+                    "*"
+                } else {
+                    ""
+                };
                 writeln!(
                     w,
                     "            {}OneOf{}::{}(m) => {{ w.write_with_tag({}, |w| w.{})? }},",
@@ -2510,20 +2558,11 @@ impl OneOf {
                     self.name,
                     f.name,
                     f.tag(),
-                    f.typ.get_write("*m", f.boxed)
+                    f.typ.get_write(&format!("{operator}m"), f.boxed)
                 )?;
-            } else {
-                writeln!(
-                    w,
-                    "            {}OneOf{}::{}(m) => {{ w.write_with_tag({}, |w| w.{})? }},",
-                    self.get_modules(desc),
-                    self.name,
-                    f.name,
-                    f.tag(),
-                    f.typ.get_write("m", f.boxed)
-                )?;
-            }
-        }
+                Ok(FieldWriteStatus::Written)
+            })
+            .collect::<Result<Vec<_>>>()?;
         writeln!(
             w,
             "            {}OneOf{}::None => {{}},",
@@ -2531,7 +2570,14 @@ impl OneOf {
             self.name
         )?;
         writeln!(w, "        }}")?;
-        Ok(())
+        let wrote_field = field_statuses
+            .into_iter()
+            .any(|status| matches!(status, FieldWriteStatus::Written));
+        if wrote_field {
+            Ok(FieldWriteStatus::Written)
+        } else {
+            Ok(FieldWriteStatus::Skipped)
+        }
     }
 }
 
@@ -2671,7 +2717,7 @@ impl FileDescriptor {
         if !rem.is_empty() {
             return Err(Error::TrailingGarbage(rem.chars().take(50).collect()));
         }
-        for mut m in &mut desc.messages {
+        for m in &mut desc.messages {
             if m.path.as_os_str().is_empty() {
                 m.path = in_file.to_path_buf();
                 if !import_search_path.is_empty() {

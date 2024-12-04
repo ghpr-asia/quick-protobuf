@@ -8,6 +8,21 @@
   - test: Adding missing tests
   - chore: Changes to the build process or auxiliary tools/libraries/documentation
 
+## pb-rs 0.11.0
+- fix: appropriately immutable messages when from_reader() does not mutate it
+- fix: appropriately marked unused variables in write_message()
+- feat: add PackedFixed struct to fix UB
+- fix: fix comment and whitespace parsing
+- fix: fix default derive
+- fix: custom default not showing up in get_size() and write_message()
+- chore: add msrv for crate packages
+- chore: bump rust edition from 2018 -> 2021
+
+## quick-protobuf 0.9.0
+- style: update codebase formatting
+- test: update test output error messages
+- chore: add msrv for crate packages
+
 ## pb-rs 0.10.0
 - fix: fix nested items and package name resolution
 - fix: parser now parses comments successfully
